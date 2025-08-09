@@ -1,0 +1,1162 @@
+<roblox version="4">
+  <Item class="ReplicatedStorage" referent="0">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="ModuleScript" referent="1">
+      <Properties>
+        <string name="Name">Networker</string>
+        <string name="Source">local RunService = game:GetService('RunService')
+
+local networker = RunService:IsServer() and require(script.Server) or require(script.Client)
+
+local NetworkerAPI = {}
+
+NetworkerAPI.new = networker.new
+
+NetworkerAPI.symbol = require(script.CrossSymbol)
+
+return NetworkerAPI</string>
+      </Properties>
+      <Item class="ModuleScript" referent="2">
+        <Properties>
+          <string name="Name">Client</string>
+          <string name="Source">local RunService = game:GetService('RunService')
+
+local Util = script.Parent.Util
+local Assert = require(Util.Assert)
+
+local Compresser = require(script.Parent.Compresser)
+local CrossSymbol = require(script.Parent.CrossSymbol)
+
+local InvokeSymbol = CrossSymbol.waitFor('Invoke')
+local InvokeResponseSymbol = CrossSymbol.waitFor('InvokeResponse')
+
+local remote = script.Parent:WaitForChild('NetworkerRemote')
+
+local ClientNetworker = {}
+ClientNetworker._networkers = {}
+ClientNetworker._sendQueue = {}
+
+function ClientNetworker.new(name, context)
+    Assert(type(name) == 'string', 'Invalid argument #1 (must be a \'string\')')
+    Assert(context == nil or typeof(context) == 'table', 'Invalid argument #2 (must be a \'table\' or \'nil\')')
+
+    if ClientNetworker._networkers[name] ~= nil then
+        if ClientNetworker._networkers[name] == false then
+            while not ClientNetworker._networkers[name] do
+                task.wait()
+            end
+        end
+        return ClientNetworker._networkers[name]
+    end
+    ClientNetworker._networkers[name] = false
+
+    local self = setmetatable({}, {__index = ClientNetworker})
+    self._name = name
+    self._symbol = CrossSymbol.waitFor(name)
+    self._isAlive = true
+    self._connections = {}
+    self._invokeThreads = {}
+    self._onInvoke = nil
+    self._rate = context and context.rate or nil
+    self._inboundMiddleware = context and context.inboundMiddleware or {}
+    self._outboundMiddleware = context and context.outboundMiddleware or {}
+
+    ClientNetworker._networkers[self._name] = self
+
+    return self
+end
+
+function ClientNetworker.getNetworker(name)
+    return ClientNetworker._networkers[name]
+end
+
+function ClientNetworker:Fire(...)
+    table.insert(ClientNetworker._sendQueue, {
+        networker = self,
+        args = {...}
+    })
+end
+
+function ClientNetworker:Invoke(...)
+    local thread = coroutine.running()
+    table.insert(ClientNetworker._sendQueue, {
+        invoke = true,
+        thread = thread,
+        networker = self,
+        args = {...}
+    })
+    return coroutine.yield()
+end
+
+function ClientNetworker:OnInvoke(callback)
+    Assert(typeof(callback) == "function", 'Invalid argument #1 (must be a \'function\')')
+    self._onInvoke = callback
+end
+
+function ClientNetworker:Once(callback)
+    Assert(typeof(callback) == "function", 'Invalid argument #1 (must be a \'function\')')
+    local connection
+    connection = self:Connect(function(...)
+        connection:Disconnect()
+        callback(...)
+    end)
+    return connection
+end
+
+function ClientNetworker:Connect(callback)
+    Assert(typeof(callback) == "function", 'Invalid argument #1 (must be a \'function\')')
+    return self:_connect(callback)
+end
+
+function ClientNetworker:DisconnectAll()
+    for _, connection in self._connections do
+        if connection._metadata.isImportant then
+            continue
+        end
+        connection:Disconnect()
+    end
+end
+
+function ClientNetworker:getName()
+    return self._name
+end
+
+function ClientNetworker:getRate()
+    return self._rate
+end
+
+function ClientNetworker:setRate(rate)
+    Assert(typeof(rate) == "number", 'Invalid argument #1 (must be a \'number\')')
+    self._rate = rate
+end
+
+function ClientNetworker:Destroy()
+    ClientNetworker._networkers[self._name] = nil
+    for _, connection in self._connections do
+        connection:Disconnect()
+    end
+    self._isAlive = false
+end
+
+function ClientNetworker:_connect(callback, isImportant)
+    local connections = self._connections
+
+    local connection = {
+        _metadata = {
+            callback = callback,
+            isImportant = isImportant
+        },
+        _id = Compresser.createUUID(),
+        _isAlive = true
+    }
+    setmetatable(connection, {__index = connection})
+
+    function connection:Disconnect()
+        self._isAlive = false
+        connections[self._id] = nil
+    end
+
+    connections[connection._id] = connection
+    return connection
+end
+
+function ClientNetworker:_handleOutboundRequest(request)
+    if not self._isAlive then
+        return
+    end
+
+    local data = {self._symbol}
+    if request.invoke then
+        local id = Compresser.createUUID()
+        self._invokeThreads[id] = request.thread
+        table.insert(data, InvokeSymbol..Compresser.compressUUID(id))
+    elseif request.invokeResponse then
+        table.insert(data, InvokeResponseSymbol..request.id)
+    end
+    for _, arg in request.args do
+        table.insert(data, arg)
+    end
+
+    return data
+end
+
+function ClientNetworker:_handleInboundRequest(request)
+    if not self._isAlive then
+        return
+    end
+
+    if typeof(request[2]) == 'string' then
+        if string.find(request[2], '^'..InvokeSymbol) then
+            local _, e = string.find(request[2], '^'..InvokeSymbol)
+            local id = string.sub(request[2], e+1, request[2]:len())
+            local args = self._onInvoke and table.pack(self._onInvoke(table.unpack(request, 3))) or {}
+            table.insert(ClientNetworker._sendQueue, {
+                invokeResponse = true,
+                id = id,
+                networker = self,
+                args = { table.unpack(args) }
+            })
+            return
+        end
+        if string.find(request[2], '^'..InvokeResponseSymbol) then
+            local _, e = string.find(request[2], '^'..InvokeResponseSymbol)
+            local id = Compresser.decompressUUID(string.sub(request[2], e+1, request[2]:len()))
+            task.spawn(self._invokeThreads[id], table.unpack(request, 3))
+            self._invokeThreads[id] = nil
+            return
+        end
+    end
+
+    for _, connection in self._connections do
+        connection._metadata.callback(table.unpack(request, 2))
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    local payload = {}
+
+    for _, request in ClientNetworker._sendQueue do
+        task.spawn(function()
+            table.insert(payload, request.networker:_handleOutboundRequest(request))
+        end)
+    end
+    table.clear(ClientNetworker._sendQueue)
+
+    remote:FireServer(Compresser.compress(payload))
+end)
+
+remote.OnClientEvent:Connect(function(payload)
+    payload = Compresser.decompress(payload)
+    for _, request in payload do
+        task.spawn(function()
+            local networker = ClientNetworker.getNetworker(CrossSymbol.getId(request[1]))
+            if networker then
+                networker:_handleInboundRequest(request)
+            end
+        end)
+    end
+end)
+
+return ClientNetworker</string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">Compresser</string>
+          <string name="Source">local RunService = game:GetService('RunService')
+local HttpService = game:GetService('HttpService')
+
+local Util = script.Parent.Util
+local Assert = require(Util.Assert)
+local Copy = require(Util.Copy)
+local DeepEqual = require(Util.DeepEqual)
+
+local CrossSymbol = require(script.Parent.CrossSymbol)
+
+local isServer = RunService:IsServer()
+
+local compresserId
+if isServer then
+    compresserId = CrossSymbol.create('Compresser')
+else
+    compresserId = CrossSymbol.get('Compresser')
+end
+
+local function fromHex(input)
+	return string.gsub(input, "..", function(hex)
+		return string.char(tonumber(hex, 16))
+	end)
+end
+
+local function toHex(input)
+	return string.gsub(input, ".", function(char)
+		return string.format("%02X", string.byte(char))
+	end)
+end
+
+local Compresser = {}
+
+function Compresser.compress(input)
+    Assert(typeof(input) == 'table', 'Invalid argument #1 (must be a \'table\')')
+    input = Copy(input)
+    local searchedKeys = {}
+    for key, request in input do
+        local compresserIndex
+        local compressedLength = 1
+        if typeof(request) == 'table' then
+            local requestCopy = Copy(request)
+            for otherKey, otherRequest in input do
+                if table.find(searchedKeys, otherKey) or otherKey == key or typeof(otherRequest) ~= 'table' then
+                    continue
+                end
+                if DeepEqual(requestCopy, otherRequest) then
+                    compressedLength += 1
+                    input[otherKey] = nil
+                    if not compresserIndex then
+                        compresserIndex = #request+1
+                        request[compresserIndex] = compresserId
+                    end
+                    request[compresserIndex] = compresserId..string.pack('H', compressedLength)
+                end
+            end
+        end
+        table.insert(searchedKeys, key)
+    end
+    return input
+end
+
+function Compresser.decompress(input)
+    local output = {}
+    for key, request in input do
+        local num = 1
+        for argIndex, arg in request do
+            if typeof(arg) == 'string' then
+                local s, e = string.find(arg, compresserId)
+                if s and s == 1 then
+                    num = string.unpack('H', string.sub(arg, e+1))
+                    request[argIndex] = nil
+                end
+            end
+            for i = 0, num-1 do
+                output[key+i] = request
+            end
+        end
+    end
+    return output
+end
+
+function Compresser.createUUID()
+    return string.gsub(HttpService:GenerateGUID(false), '-', '')
+end
+
+function Compresser.compressUUID(id)
+    return fromHex(id or Compresser.createId())
+end
+
+function Compresser.decompressUUID(input)
+    return toHex(input)
+end
+
+return Compresser</string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="4">
+        <Properties>
+          <string name="Name">CrossSymbol</string>
+          <string name="Source">local RunService = game:GetService('RunService')
+
+local Util = script.Parent.Util
+local Assert = require(Util.Assert)
+
+local isServer = RunService:IsServer()
+
+local function getRemote()
+    if isServer then
+        local remote = Instance.new('RemoteEvent', script.Parent)
+        remote.Name = 'SymbolRemote'
+        return remote
+    else
+        return script.Parent:WaitForChild('SymbolRemote')
+    end
+end
+
+local symbolRemote = getRemote()
+
+local function packNumber(num)
+    return string.pack('H', num):gsub('[\00]+$', '')
+end
+
+local idToSymbols = {}
+local symbolToId = {}
+local symbolsNum = 0
+
+local CrossSymbol = {}
+
+function CrossSymbol.create(id)
+    Assert(isServer, 'You can only create symbols on the client')
+    Assert(idToSymbols[id] == nil, 'Invalid argument #1 (Symbol already exists)')
+    Assert(symbolsNum &lt;= 65535, 'Maximum symbols created')
+
+    symbolsNum += 1
+
+    local symbol = packNumber(symbolsNum)
+
+    idToSymbols[id] = symbol
+    symbolToId[symbol] = id
+
+    symbolRemote:FireAllClients(id, symbol)
+    
+    return symbol
+end
+
+function CrossSymbol.waitForSymbol(id)
+    while not idToSymbols[id] do
+        task.wait()
+    end
+    return idToSymbols[id]
+end
+CrossSymbol.waitFor = CrossSymbol.waitForSymbol
+
+function CrossSymbol.waitForId(symbol)
+    while not symbolToId[symbol] do
+        task.wait()
+    end
+    return symbolToId[symbol]
+end
+
+function CrossSymbol.getSymbol(id)
+    return idToSymbols[id]
+end
+CrossSymbol.get = CrossSymbol.getSymbol
+
+function CrossSymbol.getId(symbol)
+    return symbolToId[symbol]
+end
+
+if not isServer then
+    local thread = coroutine.running()
+    symbolRemote.OnClientEvent:Connect(function(arg1, arg2)
+        if typeof(arg1) == 'table' then
+            idToSymbols = arg1
+            for id, symbol in idToSymbols do
+                symbolToId[symbol] = id
+            end
+        end
+        idToSymbols[arg1] = arg2
+        task.spawn(thread)
+    end)
+    symbolRemote:FireServer()
+    coroutine.yield()
+else
+    symbolRemote.OnServerEvent:Connect(function(plr)
+        symbolRemote:FireClient(plr, idToSymbols)
+    end)
+end
+
+return CrossSymbol</string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="5">
+        <Properties>
+          <string name="Name">Server</string>
+          <string name="Source">local RunService = game:GetService('RunService')
+local Players = game:GetService('Players')
+
+local Util = script.Parent.Util
+local Assert = require(Util.Assert)
+local Error = require(Util.Error)
+
+local Compresser = require(script.Parent.Compresser)
+local CrossSymbol = require(script.Parent.CrossSymbol)
+
+local NilSymbol = CrossSymbol.create('nil')
+local InvokeSymbol = CrossSymbol.create('Invoke')
+local InvokeResponseSymbol = CrossSymbol.create('InvokeResponse')
+
+local remote = Instance.new('RemoteEvent', script.Parent)
+remote.Name = 'NetworkerRemote'
+
+local ServerNetworker = {}
+ServerNetworker._networkers = {}
+ServerNetworker._sendQueue = {}
+
+function ServerNetworker.new(name, context)
+    Assert(type(name) == 'string', 'Invalid argument #1 (must be a \'string\')')
+    Assert(ServerNetworker._networkers[name] == nil, 'Invalid argument #1 (Networker with name: "'..name..'" already exists)')
+    Assert(context == nil or typeof(context) == 'table', 'Invalid argument #2 (must be a \'table\' or \'nil\')')
+
+    if ServerNetworker._networkers[name] ~= nil then
+        if ServerNetworker._networkers[name] == false then
+            while not ServerNetworker._networkers[name] do
+                task.wait()
+            end
+        end
+        return ServerNetworker._networkers[name]
+    end
+    ServerNetworker._networkers[name] = false
+
+    local self = setmetatable({}, {__index = ServerNetworker})
+    self._name = name
+    self._symbol = CrossSymbol.create(name)
+    self._isAlive = true
+    self._connections = {}
+    self._invokeThreads = {}
+    self._onInvoke = nil
+    self._rate = context and context.rate or nil
+    self._inboundMiddleware = context and context.inboundMiddleware or {}
+    self._outboundMiddleware = context and context.outboundMiddleware or {}
+    
+    ServerNetworker._networkers[self._name] = self
+
+    return self
+end
+
+function ServerNetworker.getNetworker(name)
+    return ServerNetworker._networkers[name]
+end
+
+function ServerNetworker:Fire(clients, ...)
+    Assert(typeof(clients) == "Instance" and clients.ClassName == "Player" or typeof(clients) == "table", 'Invalid argument #1 (must be a table or player instance)')
+
+    table.insert(ServerNetworker._sendQueue, {
+        networker = self,
+        clients = clients,
+        args = {...}
+    })
+end
+
+function ServerNetworker:FireAll(...)
+    table.insert(ServerNetworker._sendQueue, {
+        networker = self,
+        clients = 'all',
+        args = {...}
+    })
+end
+
+function ServerNetworker:FireAllExcept(blacklisted, ...)
+    if typeof(blacklisted) == "Instance" and blacklisted.ClassName == "Player" then
+        blacklisted = { blacklisted }
+    end
+    Assert(typeof(blacklisted) == "table", 'Invalid argument #1 (must be a table or player instance)')
+    
+    local clients = {}
+
+    for _, plr in Players:GetPlayers() do
+        if table.find(blacklisted, plr) then
+            continue
+        end
+		table.insert(clients, plr)
+	end
+
+    table.insert(ServerNetworker._sendQueue, {
+        networker = self,
+        clients = clients,
+        args = {...}
+    })
+end
+
+function ServerNetworker:Invoke(plr, ...)
+    Assert(typeof(plr) == "Instance" and plr.ClassName == "Player", 'Invalid argument #1 (must be a table or player instance)')
+    local thread = coroutine.running()
+    table.insert(ServerNetworker._sendQueue, {
+        invoke = true,
+        thread = thread,
+        networker = self,
+        clients = plr,
+        args = {...}
+    })
+    return coroutine.yield()
+end
+
+function ServerNetworker:OnInvoke(callback)
+    Assert(typeof(callback) == "function", 'Invalid argument #1 (must be a \'function\')')
+    self._onInvoke = callback
+end
+
+function ServerNetworker:Once(callback)
+    Assert(typeof(callback) == "function", 'Invalid argument #1 (must be a \'function\')')
+    local connection
+    connection = self:Connect(function(...)
+        connection:Disconnect()
+        callback(...)
+    end)
+    return connection
+end
+
+function ServerNetworker:Connect(callback)
+    Assert(typeof(callback) == "function", 'Invalid argument #1 (must be a \'function\')')
+    return self:_connect(callback)
+end
+
+function ServerNetworker:DisconnectAll()
+    for _, connection in self._connections do
+        if connection._metadata.isImportant then
+            continue
+        end
+        connection:Disconnect()
+    end
+end
+
+function ServerNetworker:getName()
+    return self._name
+end
+
+function ServerNetworker:getRate()
+    return self._rate
+end
+
+function ServerNetworker:setRate(rate)
+    Assert(typeof(rate) == "number", 'Invalid argument #1 (must be a \'number\')')
+    self._rate = rate
+end
+
+function ServerNetworker:Destroy()
+    ServerNetworker._networkers[self._name] = nil
+    for _, connection in self._connections do
+        connection:Disconnect()
+    end
+    self._isAlive = false
+end
+
+function ServerNetworker:_connect(callback, isImportant)
+    local connections = self._connections
+
+    local connection = {
+        _metadata = {
+            callback = callback,
+            isImportant = isImportant
+        },
+        _id = Compresser.createUUID(),
+        _isAlive = true
+    }
+    setmetatable(connection, {__index = connection})
+
+    function connection:Disconnect()
+        self._isAlive = false
+        connections[self._id] = nil
+    end
+
+    connections[connection._id] = connection
+    return connection
+end
+
+function ServerNetworker:_handleOutboundRequest(request, addToPayload)
+    if not self._isAlive then
+        return
+    end
+
+    local data = {self._symbol}
+    if request.invoke then
+        local id = Compresser.createUUID()
+        self._invokeThreads[id] = request.thread
+        table.insert(data, InvokeSymbol..Compresser.compressUUID(id))
+    elseif request.invokeResponse then
+        table.insert(data, InvokeResponseSymbol..request.id)
+    end
+    for _, arg in request.args do
+        table.insert(data, arg)
+    end
+
+    local clients = request.clients
+    if clients == 'all' then
+        for _, client in Players:GetPlayers() do
+            addToPayload(client, data)
+        end
+    elseif typeof(clients) == "table" then
+        for _, client in clients do
+            addToPayload(client, data)
+        end
+    elseif typeof(clients) == "Instance" and clients.ClassName == "Player" then
+        addToPayload(clients, data)
+    end
+end
+
+function ServerNetworker:_handleInboundRequest(plr, request)
+    if not self._isAlive then
+        return
+    end
+
+    if typeof(request[2]) == 'string' then
+        if string.find(request[2], '^'..InvokeSymbol) then
+            local _, e = string.find(request[2], '^'..InvokeSymbol)
+            local id = string.sub(request[2], e+1, request[2]:len())
+            local args = self._onInvoke and table.pack(self._onInvoke(table.unpack(request, 3))) or {}
+            table.insert(ServerNetworker._sendQueue, {
+                invokeResponse = true,
+                id = id,
+                networker = self,
+                clients = plr,
+                args = { table.unpack(args) }
+            })
+            return
+        end
+        if string.find(request[2], '^'..InvokeResponseSymbol) then
+            local _, e = string.find(request[2], '^'..InvokeResponseSymbol)
+            local id = Compresser.decompressUUID(string.sub(request[2], e+1, request[2]:len()))
+            task.spawn(self._invokeThreads[id], table.unpack(request, 3))
+            self._invokeThreads[id] = nil
+            return
+        end
+    end
+
+    for _, connection in self._connections do
+        connection._metadata.callback(table.unpack(request, 2))
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    local payloads = {}
+
+    local function addToPayload(client, data)
+        if not payloads[client] then
+            payloads[client] = {}
+        end
+        table.insert(payloads[client], data)
+    end
+
+    for _, request in ServerNetworker._sendQueue do
+        task.spawn(function()
+            request.networker:_handleOutboundRequest(request, addToPayload)
+        end)
+    end
+
+    table.clear(ServerNetworker._sendQueue)
+
+    for client, payload in payloads do
+        remote:FireClient(client, Compresser.compress(payload))
+    end
+end)
+
+remote.OnServerEvent:Connect(function(plr, payload)
+    payload = Compresser.decompress(payload)
+    for _, request in payload do
+        task.spawn(function()
+            local networker = ServerNetworker.getNetworker(CrossSymbol.getId(request[1]))
+            if networker then
+                networker:_handleInboundRequest(plr, request)
+            end
+        end)
+    end
+end)
+
+return ServerNetworker</string>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="6">
+        <Properties>
+          <string name="Name">Util</string>
+        </Properties>
+        <Item class="ModuleScript" referent="7">
+          <Properties>
+            <string name="Name">Assert</string>
+            <string name="Source"><![CDATA[return function(condition, message, level)
+	if not condition then
+		error("[Networker] - " .. message, level or 3)
+	end
+end
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="8">
+          <Properties>
+            <string name="Name">Copy</string>
+            <string name="Source"><![CDATA[local function copy(tbl, cache)
+	if not cache then
+		cache = { tbl = true }
+	end
+
+	local newTable = {}
+	local mt = getmetatable(tbl)
+	for i, v in pairs(tbl) do
+		if typeof(v) == "table" then
+			if cache[v] then
+				newTable[i] = v
+			else
+				cache[v] = true
+				newTable[i] = copy(v, cache)
+			end
+		else
+			newTable[i] = v
+		end
+	end
+	setmetatable(newTable, mt)
+	return newTable
+end
+
+return copy
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="9">
+          <Properties>
+            <string name="Name">DeepEqual</string>
+            <string name="Source"><![CDATA[local Util = script.Parent
+local Assert = require(Util.Assert)
+
+local function equal(v1, v2)
+	if v1 == v2 then
+		return true
+	end
+	if typeof(v1) == "function" or typeof(v2) == "function" then
+		return false
+	end
+	if typeof(v1) == "table" and typeof(v2) == "table" then
+		if #v1 ~= #v2 then
+			return false
+		end
+		return true, true
+	end
+	return false
+end
+
+local function deepEqual(v1, v2, howDeep)
+	Assert(howDeep == nil or typeof(howDeep) == "number", "Invalid argument #1 (Must be of type 'number')")
+	local equal, table = equal(v1, v2)
+	if not equal then
+		return false
+	else
+		if not table then
+			return true
+		else
+			for i, v in pairs(v1) do
+				if not howDeep or howDeep > 0 then
+					if not deepEqual(v, v2[i], (howDeep and howDeep - 1)) then
+						return false
+					end
+				else
+					local equal = equal(v1, v2)
+					if not equal then
+						return false
+					end
+				end
+			end
+			for i, v in pairs(v2) do
+				if not howDeep or howDeep > 0 then
+					if not deepEqual(v, v1[i], (howDeep and howDeep - 1)) then
+						return false
+					end
+				else
+					local equal = equal(v1, v2)
+					if not equal then
+						return false
+					end
+				end
+			end
+			return true
+		end
+	end
+end
+
+return deepEqual
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="10">
+          <Properties>
+            <string name="Name">Error</string>
+            <string name="Source">return function(message, level)
+    error("[Networker] - " .. message, level or 3)
+end</string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="11">
+        <Properties>
+          <string name="Name">old</string>
+          <string name="Source"><![CDATA[local RunService = game:GetService("RunService")
+
+local Networker = {}
+Networker._Networkers = {}
+
+local networkerCache = {}
+
+local function createNetworker(name, networkerType)
+	local networker = Instance.new(networkerType, script)
+	networker.Name = name..'_'..networkerType
+	return networker
+end
+
+local function getNetworker(name, networkerType)
+	local networker = script:FindFirstChild(name..'_'..networkerType)
+	assert(networker, 'Invalid networker')
+	return networker
+end
+
+local function networkerExists(name)
+	return (script:FindFirstChild(name..'_'..'RemoteEvent') or script:FindFirstChild(name..'_'..'RemoteFunction') or script:FindFirstChild(name..'_'..'BindableEvent') or script:FindFirstChild(name..'_'..'BindableFunction'))
+end
+
+local function assert(condition, msg)
+	if not condition then
+		error(msg, 2)
+	end
+end
+
+function Networker:CreateNetworker(name)
+	assert(typeof(name) == 'string', 'Invalid argument #1 (must be of type \'string\')')
+	local self = setmetatable({}, {__index = Networker})
+	self.name = name
+
+	self._RemoteEvent = createNetworker(name, 'RemoteEvent')
+	self._RemoteFunction = createNetworker(name, 'RemoteFunction')
+	self._BindableEvent = createNetworker(name, 'BindableEvent')
+	self._BindableFunction = createNetworker(name, 'BindableFunction')
+
+	networkerCache[name] = self
+	return self
+end
+Networker.createNetworker = Networker.CreateNetworker
+
+function Networker:GetNetworker(name)
+	assert(typeof(name) == 'string', 'Invalid argument #1 (must be of type \'string\')')
+	if networkerCache[name] then
+		return networkerCache[name]
+	end
+	assert(networkerExists(name), 'Invalid argument #1 (must be a valid networker)')
+	local self = setmetatable({}, {__index = Networker})
+	self.name = name
+
+	self._RemoteEvent = getNetworker(name, 'RemoteEvent')
+	self._RemoteFunction = getNetworker(name, 'RemoteFunction')
+	self._BindableEvent = getNetworker(name, 'BindableEvent')
+	self._BindableFunction = getNetworker(name, 'BindableFunction')
+
+	networkerCache[name] = self
+	return self
+end
+Networker.getNetworker = Networker.GetNetworker
+
+if RunService:IsServer() then
+	function Networker:OnEvent(func)
+		assert(typeof(func) == 'function', 'Invalid argument #1 (must be of type \'function\')')
+		return self._RemoteEvent.OnServerEvent:Connect(func)
+	end
+	Networker.onEvent = Networker.OnEvent
+
+	function Networker:OnInvoke(func)
+		assert(typeof(func) == 'function', 'Invalid argument #1 (must be of type \'function\')')
+		self._RemoteFunction.OnServerInvoke = func
+	end
+	Networker.onInvoke = Networker.OnInvoke
+
+	function Networker:OnBindableEvent(func)
+		assert(typeof(func) == 'function', 'Invalid argument #1 (must be of type \'function\')')
+		return self._BindableEvent.Event:Connect(func)
+	end
+	Networker.onBindableEvent = Networker.OnBindableEvent
+
+	function Networker:OnBindableInvoke(func)
+		assert(typeof(func) == 'function', 'Invalid argument #1 (must be of type \'function\')')
+		self._BindableFunction.OnInvoke = func
+	end
+	Networker.onBindableInvoke = Networker.OnBindableInvoke
+
+	function Networker:Send(client, ...)
+		assert(typeof(client) == 'Instance' and client.ClassName == 'Player', 'Invalid argument #1 (must be a valid Player)')
+		self._RemoteEvent:FireClient(client, ...)
+	end
+	Networker.send = Networker.Send
+
+	function Networker:SendAll(...)
+		self._RemoteEvent:FireAllClients(...)
+	end
+	Networker.sendAll = Networker.SendAll
+
+	function Networker:Get(client, ...)
+		assert(typeof(client) == 'Instance' and client.ClassName == 'Player', 'Invalid argument #1 (must be a valid Player)')
+		return self._RemoteFunction:InvokeClient(client, ...)
+	end
+	Networker.get = Networker.Get
+
+	function Networker:Fire(...)
+		self._BindableEvent:Fire(...)
+	end
+	Networker.fire = Networker.Fire
+
+	function Networker:Invoke(...)
+		self._BindableFunction:Invoke(...)
+	end
+	Networker.invoke = Networker.Invoke
+else
+	function Networker:OnEvent(func)
+		assert(typeof(func) == 'function', 'Invalid argument #1 (must be of type \'function\')')
+		return self._RemoteEvent.OnClientEvent:Connect(func)
+	end
+	Networker.onEvent = Networker.OnEvent
+
+	function Networker:OnInvoke(func)
+		assert(typeof(func) == 'function', 'Invalid argument #1 (must be of type \'function\')')
+		self._RemoteFunction.OnClientInvoke = func
+	end
+	Networker.onInvoke = Networker.OnInvoke
+
+	function Networker:OnBindableEvent(func)
+		assert(typeof(func) == 'function', 'Invalid argument #1 (must be of type \'function\')')
+		return self._BindableEvent.Event:Connect(func)
+	end
+	Networker.onBindableEvent = Networker.OnBindableEvent
+
+	function Networker:OnBindableInvoke(func)
+		assert(typeof(func) == 'function', 'Invalid argument #1 (must be of type \'function\')')
+		self._BindableFunction.OnInvoke = func
+	end
+	Networker.onBindableInvoke = Networker.OnBindableInvoke
+
+	function Networker:Send(...)
+		self._RemoteEvent:FireServer(...)
+	end
+	Networker.send = Networker.Send
+
+	function Networker:Get(...)
+		return self._RemoteFunction:InvokeServer(...)
+	end
+	Networker.get = Networker.Get
+
+	function Networker:Fire(...)
+		self._BindableEvent:Fire(...)
+	end
+	Networker.fire = Networker.Fire
+
+	function Networker:Invoke(...)
+		return self._BindableFunction:Invoke(...)
+	end
+	Networker.invoke = Networker.Invoke
+end
+
+return setmetatable({}, {__index = Networker})
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="ModuleScript" referent="12">
+      <Properties>
+        <string name="Name">Settings</string>
+        <string name="Source">return {
+    StressTest = true,
+    NativeNetworking = false
+}</string>
+      </Properties>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="13">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Folder" referent="14">
+      <Properties>
+        <string name="Name">Tests</string>
+      </Properties>
+      <Item class="Script" referent="15">
+        <Properties>
+          <string name="Name">Test</string>
+          <string name="Source"><![CDATA[local RS = game:GetService('ReplicatedStorage')
+local Players = game:GetService('Players')
+local RunService = game:GetService('RunService')
+
+local Networker = require(RS.Networker)
+local Settings = require(RS.Settings)
+
+if Settings.StressTest then
+    if Settings.NativeNetworking then
+        local remote = Instance.new("RemoteEvent")
+        remote.Name = "StressRemote"
+        remote.Parent = RS
+    
+        RunService.Heartbeat:Connect(function()
+            for _ = 1, 200 do
+                remote:FireAllClients()
+            end
+        end)
+    else
+        local remote = Networker.new('StressRemote')
+        RunService.Heartbeat:Connect(function()
+            for _ = 1, 200 do
+                remote:FireAll()
+            end
+        end)
+    end
+else
+    local remote = Networker.new('TestRemote')
+    Players.PlayerAdded:Connect(function(plr)
+        remote:OnInvoke(function(a, b, c)
+            print('[Invoke]', a, b, c)
+            return c, b, a
+        end)
+        remote:Connect(function(...)
+            print('[Fire]', ...)
+        end)
+        remote:Once(function(...)
+            print('[Once]', ...)
+        end)
+
+        task.wait(4)
+
+        remote:Fire(plr, 'Fire 1 from server')
+        remote:Fire(plr, 'Fire 2 from server')
+        print('[Invoke]', remote:Invoke(plr, 'a', 'b', 'c'))
+    end)
+end
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="16">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="17">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="Folder" referent="18">
+        <Properties>
+          <string name="Name">Tests</string>
+        </Properties>
+        <Item class="LocalScript" referent="19">
+          <Properties>
+            <string name="Name">Test</string>
+            <string name="Source"><![CDATA[local RS = game:GetService('ReplicatedStorage')
+
+local Networker = require(RS.Networker)
+local Settings = require(RS.Settings)
+
+if Settings.StressTest then
+    if Settings.NativeNetworking then
+        local remote = RS:WaitForChild("StressRemote")
+        remote.OnClientEvent:Connect(function() end)
+    else
+        local remote = Networker.new('StressRemote')
+        remote:Connect(function() end)
+    end
+else
+    local remote = Networker.new('TestRemote')
+    remote:OnInvoke(function(a, b, c)
+        print('[Invoke]', a, b, c)
+        return c, b, a
+    end)
+    remote:Connect(function(...)
+        print('[Fire]', ...)
+    end)
+    remote:Once(function(...)
+        print('[Once]', ...)
+    end)
+
+    remote:Fire('Fire 1 from client')
+    remote:Fire('Fire 2 from client')
+    print('[Invoke]', remote:Invoke('a', 'b', 'c'))
+
+    print('-------------------------------------')
+end
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="Workspace" referent="20">
+    <Properties>
+      <string name="Name">Workspace</string>
+    </Properties>
+    <Item class="Part" referent="21">
+      <Properties>
+        <string name="Name">Baseplate</string>
+        <bool name="Anchored">true</bool>
+        <Color3uint8 name="Color3uint8">6512483</Color3uint8>
+        <bool name="Locked">true</bool>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>-5</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>512</X>
+          <Y>20</Y>
+          <Z>512</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
